@@ -1,0 +1,19 @@
+# CoinSvr SpikeScalp 자동분석 연속성 기록
+
+이 파일은 `CLAUDE_CODE_TASK_SPIKE.md`(1시간 주기 자동화)가 매 사이클 append하는 로그다.
+FundingHedger의 `CLAUDE.md`와는 완전히 별개 파일 - 서로 섞지 않는다.
+
+## 프로젝트 배경
+FundingHedger(펀딩비 정산 타이밍 기반)와 별개로, 펀딩비와 무관하게 가격+거래대금 동시 스파이크가
+뜬 심볼을 모멘텀 방향으로 짧게(1~5분) 추격 진입 후 트레일링스탑/고정SL/타임아웃 중 먼저 오는
+조건으로 정리하는 단순 테스트 모듈. 2026-07-16 최초 구현, 현재 `SpikeScalpManager.DebugDryRun=true`
+(드라이런 - 실주문 없음, BookTicker 실데이터로 PnL만 시뮬레이션).
+
+## 초기 설정값 (2026-07-16 기준)
+- SpikeThresholdPct=0.8, VolumeSpikeMultiplier=3, StopLossPct=0.3(고정,자동조정 대상 아님),
+  TrailArmPct=0.4, TrailGivebackPct=30, MaxHoldMs=180000(3분), CooldownMinutes=10,
+  MaxConcurrentPositions=3, DailyLossLimitUsdt=20(안전장치, 자동조정 대상 아님)
+- 전부 잠정값 - 표본 쌓이면 `CLAUDE_CODE_TASK_SPIKE.md` 절차에 따라 조정 예정.
+
+## 자동분석 사이클 로그
+(여기부터 매 사이클 append)

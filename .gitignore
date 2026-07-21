@@ -1,0 +1,6 @@
+CoinSvr/bin/
+CoinSvr/obj/
+CoinSvr/Tmp/
+.vs/
+.claude/settings.local.json
+*.user
