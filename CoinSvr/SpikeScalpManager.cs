@@ -36,6 +36,10 @@ namespace CoinSvr
         // ── 1단계: 광역 스캔용 롤링 버퍼 (심볼당 고정폭 큐 - 무제한 List 아님, 300+심볼 메모리 방지) ──
         private readonly ConcurrentDictionary<string, Queue<(DateTime Time, decimal Price)>> _wideHistory = new();
         private readonly ConcurrentDictionary<string, Queue<(DateTime Time, decimal QuoteVolume)>> _wideVolumeHistory = new();
+        // 2026-07-21 신규(SimulateFadeAsync용): FundingHedger의 _fundingWaiters(이벤트기반 전환)와
+        // 동일 패턴 - 광역스캔 mark price가 실제로 갱신되는 순간 즉시 깨어나도록, 고정 폴링 대신
+        // TaskCompletionSource로 대기한다.
+        private readonly ConcurrentDictionary<string, TaskCompletionSource<decimal>> _wideTickWaiters = new();
         // 24hr 티커가 이미 실어오는 PriceChangePercent를 심볼별 최신값으로만 캐시(24h 이력 버퍼링 불필요).
         // 참고용으로만 로깅 - 실제 진입 필터는 아래 1h 기준(_trend1h)을 사용(2026-07-18 백테스트로 확정).
         private readonly ConcurrentDictionary<string, decimal> _trend24h = new();
@@ -157,6 +161,11 @@ namespace CoinSvr
                     q.Enqueue((eventTime, price));
                     while (q.Count > 0 && (eventTime - q.Peek().Time).TotalSeconds > _cfg.WideWindowSec)
                         q.Dequeue();
+
+                    // SimulateFadeAsync가 폴링 대신 이 심볼의 실제 갱신을 기다리고 있으면 즉시 깨움
+                    // (스파이크 감지 여부와 무관 - 아래 표본부족 return 이전에 처리).
+                    if (_wideTickWaiters.TryRemove(symbol, out var waiter))
+                        waiter.TrySetResult(price);
 
                     if (q.Count < 5 + _cfg.ConfirmTicks) return; // 방향확인용 표본 추가 확보
                     decimal oldest = q.Peek().Price;
@@ -363,6 +372,7 @@ namespace CoinSvr
                 });
                 _ = target.RunTimeoutWatchdogAsync();
                 _ = target.RunStaleObservationAsync();
+                _ = SimulateFadeAsync(target); // 실주문 없는 가상 반대방향 포지션 - 관측 전용
             }
             catch (Exception ex) { UI($"❌ [SPIKE] TryPromoteToTargetAsync({symbol}): {ex.Message}"); }
         }
@@ -797,6 +807,87 @@ namespace CoinSvr
                 File.AppendAllText(WideSpreadSimPath, JsonSerializer.Serialize(record) + Environment.NewLine);
             }
             catch (Exception ex) { UI($"❌ [SPIKE] SimulateWideSpreadForwardAsync({symbol}): {ex.Message}"); }
+        }
+
+        // ── SL 페이드(반대방향) 가상시뮬레이션 (spike_scalp_fade_sim.jsonl, 2026-07-21 신규) ──
+        // 사람과의 대화 세션: spike_scalp_postexit.jsonl의 SL 이후 반전 데이터(n=769, Fwd30~300 전부
+        // 플러스)는 "SL난 다음 시점부터"를 잰 것이라, "처음부터 반대방향으로 진입했으면 어땠을지"와는
+        // 다른 질문 - 페이드 포지션도 진입~SL 구간의 초반 역행을 그대로 겪기 때문. 그래서 실제 진입과
+        // 동일한 시각/가격에서 방향만 반대로 잡은 가상 포지션을 만들어, 실제와 동일한 StopLossPct/
+        // TrailArmPct/TrailGivebackPct/MaxHoldMs 규칙으로 청산 시점까지 추적한다. 실주문 없음, 필터/
+        // 실거래 로직에 전혀 영향 없음(fire-and-forget 관측 전용).
+        // ponytail: 광역스캔 mark price(거래소 자체가 전체심볼 스트림을 1s 간격으로 push)를 기준으로
+        // 하는 근사치 시뮬레이션이다 - 실제 포지션처럼 bid/ask 틱 단위는 아니라 SlConfirmTicks
+        // 디바운스도 "실제 갱신 횟수" 기준으로 근사 적용된다. 스프레드/슬리피지도 반영 안 됨.
+        // 정밀검증이 필요해지면 실제 BookTicker 구독을 붙인 정식 가상포지션으로 교체.
+        private static string FadeSimPath => Path.Combine(AppContext.BaseDirectory, "spike_scalp_fade_sim.jsonl");
+
+        // 고정 폴링 대신 이 심볼의 다음 실제 가격갱신을 기다린다(2026-07-21 사람과의 대화 세션 -
+        // 펀딩쪽 이벤트기반 전환과 동일 이유: 고정 지연은 반응이 늦고, 폴링 사이의 짧은 피크를 놓친다).
+        // 피드가 멈춘 경우를 대비해 3초 타임아웃을 두고, 그때는 캐시된 최신값으로 한 번 더 판정한다.
+        private async Task<decimal?> WaitForNextWidePriceTickAsync(string symbol, double maxWaitMs)
+        {
+            var tcs = new TaskCompletionSource<decimal>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _wideTickWaiters[symbol] = tcs;
+            var winner = await Task.WhenAny(tcs.Task, Task.Delay((int)Math.Max(0, Math.Min(maxWaitMs, 3000))));
+            if (winner == tcs.Task) return await tcs.Task;
+            _wideTickWaiters.TryRemove(symbol, out _); // 타임아웃 - 등록 취소, 캐시값으로 폴백
+            return GetLatestWidePrice(symbol);
+        }
+
+        private async Task SimulateFadeAsync(SpikeTarget t)
+        {
+            try
+            {
+                var fadeSide = t.Side == OrderSide.Buy ? OrderSide.Sell : OrderSide.Buy;
+                decimal entryPrice = t.EntryPrice;
+                if (entryPrice <= 0) return;
+                DateTime entryTime = t.EntryTimestamp;
+
+                decimal peakPct = 0m, lastPnlPct = 0m;
+                int slHitCount = 0;
+                string exitReason = "TIMEOUT";
+
+                while (true)
+                {
+                    double remainMs = _cfg.MaxHoldMs - (DateTime.UtcNow - entryTime).TotalMilliseconds;
+                    if (remainMs <= 0) break;
+
+                    decimal? price = await WaitForNextWidePriceTickAsync(t.Symbol, remainMs);
+                    if (!price.HasValue || price.Value <= 0) continue;
+
+                    lastPnlPct = fadeSide == OrderSide.Buy
+                        ? (price.Value - entryPrice) / entryPrice * 100m
+                        : (entryPrice - price.Value) / entryPrice * 100m;
+                    if (lastPnlPct > peakPct) peakPct = lastPnlPct;
+
+                    bool trailArmed = peakPct >= _cfg.TrailArmPct;
+                    bool trailHit = trailArmed && (peakPct - lastPnlPct) >= _cfg.TrailGivebackPct / 100m * peakPct;
+
+                    bool slCondition = lastPnlPct <= -_cfg.StopLossPct;
+                    slHitCount = slCondition ? slHitCount + 1 : 0;
+                    bool hitSL = slHitCount >= _cfg.SlConfirmTicks;
+
+                    if (trailHit) { exitReason = "TRAIL"; break; }
+                    if (hitSL) { exitReason = "SL"; break; }
+                }
+
+                decimal realizedUsdt = lastPnlPct / 100m * (t.Qty * entryPrice);
+                var record = new
+                {
+                    Timestamp = DateTime.UtcNow,
+                    Symbol = t.Symbol,
+                    Side = fadeSide.ToString(),
+                    OriginalSide = t.Side.ToString(),
+                    SpikeChangePct = t.SpikeChangePct,
+                    ExitReason = exitReason,
+                    RealizedUsdt = realizedUsdt,
+                    PeakPct = peakPct,
+                    EntryTimestamp = entryTime,
+                };
+                File.AppendAllText(FadeSimPath, JsonSerializer.Serialize(record) + Environment.NewLine);
+            }
+            catch (Exception ex) { UI($"❌ [SPIKE] SimulateFadeAsync({t.Symbol}): {ex.Message}"); }
         }
 
         internal void UI(string msg) { try { Ob.ui?.SetText(msg); } catch { } }

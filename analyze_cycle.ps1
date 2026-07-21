@@ -13,7 +13,12 @@
     1) A/B/C(paper) 평균/승률 비교, IsBait=false만 별도 집계
     2) 실측(Actual_ProfitPct) 대조 (trade_results.jsonl에만 존재)
     3) 트레일링청산(peak>0) 목록 + giveback 비율, MaxHoldMs 타임아웃(peak=0) 건수
-    4) Trend30Pct 유효 레코드만 절댓값 구간(약/중/강)별 C/A/B 비교
+    4) Trend30Pct 유효 레코드만 절댓값 구간(약/중/강)별 C/A/B 비교 (적응형 3분위, 이번 사이클 배치 기준)
+    5) 베이지안 누적 승률 비교 (Beta-Bernoulli) - bayes_state.json에 전체 이력을 누적하여
+       "C 승률", "C vs A_Est", "C vs B_Est"의 사후분포 평균/95% 신용구간을 계산한다.
+       사이클마다 n=1~10건씩만 들어와 빈도주의 판단(누적평균/승률)이 매번 뒤집히는 문제를
+       완화하기 위함 - 4)번과 달리 구간 경계를 고정값(추세 10%/30%)으로 써서 사이클 간
+       누적이 의미를 갖게 한다. 신용구간이 50%를 걸치면 "판단보류"로 명시한다.
   를 콘솔에 표 형태로 출력한다. 여기서 나온 표를 근거로 자연어 요약(CLAUDE.md,
   automation_summary.log에 적을 문장)은 Claude가 직접 작성한다 — 이 스크립트는
   숫자 집계까지만 담당하고 해석/서술은 하지 않는다. 종료 전 analysis_state.json의
@@ -223,6 +228,78 @@ if ($combined.Count -ge 6) {
 } else {
     Write-Host "  표본부족(6건 미만) - 구간 분리 생략, 아래 개별 레코드만 참고:"
     $combined | Sort-Object Trend30 | Format-Table Symbol, Source, Trend30, CProfit, AEst, BEst -AutoSize
+}
+
+# ── 4) 베이지안 누적 승률 비교 (Beta-Bernoulli, bayes_state.json에 전체 이력 누적) ──
+# 위 3)번 구간은 "이번 사이클 배치"만의 적응형 3분위라 사이클마다 경계가 달라져 누적이
+# 안 된다. 여기서는 고정 임계값(추세 10%/30%)을 써서 사후분포가 사이클을 넘어 누적되게
+# 하고, 신용구간이 50%를 걸치면 "판단보류"로 명시해 n=1~3짜리 단일 사이클로 가설이
+# 뒤집히는 문제를 완화한다.
+# ponytail: Beta(a,b)의 정확한 역함수 대신 정규근사로 95% 신용구간을 계산한다 - a,b가
+# 아주 작을 때(누적 초반) 근사오차가 있을 수 있으나 "판단보류" 여부를 가르는 용도로는
+# 충분하다. 필요해지면 정확한 역베타로 교체.
+function New-BetaCounts { [PSCustomObject]@{ Alpha = 1.0; Beta = 1.0 } }
+function New-CompareCounts {
+    [PSCustomObject]@{ CWin = (New-BetaCounts); CvA = (New-BetaCounts); CvB = (New-BetaCounts) }
+}
+function Add-BayesOutcome {
+    param($Counts, [bool]$Win)
+    if ($Win) { $Counts.Alpha += 1 } else { $Counts.Beta += 1 }
+}
+function Get-BetaVerdict {
+    param([double]$Alpha, [double]$Beta)
+    $mean = $Alpha / ($Alpha + $Beta)
+    $var = ($Alpha * $Beta) / ([math]::Pow($Alpha + $Beta, 2) * ($Alpha + $Beta + 1))
+    $sd = [math]::Sqrt($var)
+    # [math]::Max(0, ...)처럼 정수 리터럴 0/1을 그대로 넘기면 PowerShell이 Max(Int32,Int32)
+    # 오버로드로 잘못 바인딩해 double 인자를 조용히 0으로 잘라버리는 문제가 있어(실측 확인됨),
+    # 0.0/1.0으로 명시해 Max(Double,Double)/Min(Double,Double)를 강제한다.
+    $lo = [math]::Max(0.0, $mean - 1.96 * $sd)
+    $hi = [math]::Min(1.0, $mean + 1.96 * $sd)
+    $verdict = if ($lo -gt 0.5) { "우세" } elseif ($hi -lt 0.5) { "열세" } else { "판단보류" }
+    return ("{0,5:F1}% [{1,5:F1}~{2,5:F1}%] {3} (a={4:F0} b={5:F0})" -f ($mean * 100), ($lo * 100), ($hi * 100), $verdict, $Alpha, $Beta)
+}
+
+$bayesStateFile = Join-Path $BaseDir "bayes_state.json"
+if (Test-Path $bayesStateFile) {
+    $bayesState = Get-Content $bayesStateFile -Raw | ConvertFrom-Json
+} else {
+    $bayesState = [PSCustomObject]@{
+        Global      = New-CompareCounts
+        TrendWeak   = New-CompareCounts
+        TrendMid    = New-CompareCounts
+        TrendStrong = New-CompareCounts
+    }
+}
+
+# Global: trade_results.jsonl 기준(1번 섹션과 동일하게 trades만, skip 제외) - 이번 사이클 신규분만 누적
+foreach ($t in $trades) {
+    Add-BayesOutcome $bayesState.Global.CWin ($t.C_ProfitPct -gt 0)
+    if ($null -ne $t.A_ProfitPct_Est) { Add-BayesOutcome $bayesState.Global.CvA ($t.C_ProfitPct -gt $t.A_ProfitPct_Est) }
+    if ($null -ne $t.B_ProfitPct_Est) { Add-BayesOutcome $bayesState.Global.CvB ($t.C_ProfitPct -gt $t.B_ProfitPct_Est) }
+}
+
+# 추세강도: 3번 섹션과 동일하게 trade+skip 합산($combined) - 단 구간 경계는 고정값
+foreach ($c in $combined) {
+    $absTrend = [math]::Abs($c.Trend30)
+    $bucket = if ($absTrend -lt 0.1) { $bayesState.TrendWeak } elseif ($absTrend -le 0.3) { $bayesState.TrendMid } else { $bayesState.TrendStrong }
+    Add-BayesOutcome $bucket.CWin ($c.CProfit -gt 0)
+    if ($null -ne $c.AEst) { Add-BayesOutcome $bucket.CvA ($c.CProfit -gt $c.AEst) }
+    if ($null -ne $c.BEst) { Add-BayesOutcome $bucket.CvB ($c.CProfit -gt $c.BEst) }
+}
+
+[System.IO.File]::WriteAllText($bayesStateFile, ($bayesState | ConvertTo-Json -Depth 5), $utf8NoBom)
+
+Write-Host ""
+Write-Host "--- 베이지안 누적 승률 비교 (Beta-Bernoulli, 전체 이력 누적 - 사이클 리셋 없음) ---"
+Write-Host ("  [전체]         C승률(>0)  : " + (Get-BetaVerdict $bayesState.Global.CWin.Alpha $bayesState.Global.CWin.Beta))
+Write-Host ("  [전체]         C vs A_Est : " + (Get-BetaVerdict $bayesState.Global.CvA.Alpha $bayesState.Global.CvA.Beta))
+Write-Host ("  [전체]         C vs B_Est : " + (Get-BetaVerdict $bayesState.Global.CvB.Alpha $bayesState.Global.CvB.Beta))
+foreach ($pair in @(@("약한 추세(<10%)", "TrendWeak"), @("중간 추세(10~30%)", "TrendMid"), @("강한 추세(>30%)", "TrendStrong"))) {
+    $name = $pair[0]; $b = $bayesState.($pair[1])
+    Write-Host ("  [$name] C승률(>0)  : " + (Get-BetaVerdict $b.CWin.Alpha $b.CWin.Beta))
+    Write-Host ("  [$name] C vs A_Est : " + (Get-BetaVerdict $b.CvA.Alpha $b.CvA.Beta))
+    Write-Host ("  [$name] C vs B_Est : " + (Get-BetaVerdict $b.CvB.Alpha $b.CvB.Beta))
 }
 
 Write-Host ""

@@ -22,6 +22,7 @@ LastCutoffUtc를 자동으로 읽고 갱신한다 - 더 이상 수동 편집이 
 """
 import argparse
 import json
+import math
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 BASE = Path(r"D:\000.WORK\000.NET\CoinSvr_Funding\CoinSvr\bin\Debug\net9.0")
 ARCHIVE_ROOT = BASE / "DataArchive"
 STATE_FILE = BASE / "spike_analysis_state.json"
+BAYES_STATE_FILE = BASE / "spike_bayes_state.json"
 
 FILES = ["spike_scalp_results.jsonl", "spike_scalp_skipped.jsonl",
          "spike_scalp_postexit.jsonl", "spike_scalp_trendveto_sim.jsonl"]
@@ -86,6 +88,40 @@ def read_since(filename, cutoff_dt):
 
 def avg(lst):
     return sum(lst) / len(lst) if lst else None
+
+
+def is_aligned(r):
+    trend1h = r.get("Trend1hPct")
+    spike = r.get("SpikeChangePct")
+    if trend1h is None or spike is None:
+        return None
+    return (trend1h > 0 and spike > 0) or (trend1h < 0 and spike < 0)
+
+
+# ── 베이지안 누적 승률(Beta-Bernoulli, spike_bayes_state.json에 전체 이력 누적) ──
+# ponytail: aligned/counter, buy/sell은 같은 트레이드를 짝지어 비교하는 쌍이 아니라
+# 서로 다른 트레이드 집합이라(FundingHedger 쪽 C vs A_Est처럼 트레이드 단위 짝짓기가
+# 안 됨), 정식 2-표본 베이지안 비교 대신 각 그룹의 승률 사후분포를 독립적으로 누적하고
+# 95% 신용구간으로 비교하는 방식을 쓴다(두 구간이 안 겹치면 유의미한 차이로 해석,
+# 겹치면 판단보류). 정확한 2표본 검정이 필요해지면 교체.
+def beta_verdict(alpha, beta):
+    mean = alpha / (alpha + beta)
+    var = (alpha * beta) / ((alpha + beta) ** 2 * (alpha + beta + 1))
+    sd = math.sqrt(var)
+    lo = max(0.0, mean - 1.96 * sd)
+    hi = min(1.0, mean + 1.96 * sd)
+    verdict = "우세" if lo > 0.5 else ("열세" if hi < 0.5 else "판단보류")
+    return f"{mean*100:5.1f}% [{lo*100:5.1f}~{hi*100:5.1f}%] {verdict} (a={alpha:.0f} b={beta:.0f})"
+
+
+def load_bayes_state():
+    if BAYES_STATE_FILE.exists():
+        return json.loads(BAYES_STATE_FILE.read_text(encoding="utf-8-sig"))
+    return {k: {"Alpha": 1.0, "Beta": 1.0} for k in ("Aligned", "Counter", "Buy", "Sell", "Override")}
+
+
+def add_outcome(counts, win):
+    counts["Alpha" if win else "Beta"] += 1
 
 
 def main():
@@ -230,13 +266,6 @@ def main():
     print()
     print("=== 8. TrendAligned1h 정렬여부 교차분석 ===")
     if results:
-        def is_aligned(r):
-            trend1h = r.get("Trend1hPct")
-            spike = r.get("SpikeChangePct")
-            if trend1h is None or spike is None:
-                return None
-            return (trend1h > 0 and spike > 0) or (trend1h < 0 and spike < 0)
-
         aligned_pnls, counter_pnls = [], []
         for r in results:
             al = is_aligned(r)
@@ -287,6 +316,32 @@ def main():
     if results:
         total_pnl = sum(r["RealizedUsdt"] for r in results)
         print(f"이번 사이클 건별평균: {total_pnl/len(results):.4f} (n={len(results)})")
+
+    print()
+    print("=== 12. 베이지안 누적 승률 비교 (Beta-Bernoulli, spike_bayes_state.json에 전체 이력 누적) ===")
+    if results:
+        bayes = load_bayes_state()
+        for r in results:
+            win = r["RealizedUsdt"] > 0
+            al = is_aligned(r)
+            if al is True:
+                add_outcome(bayes["Aligned"], win)
+            elif al is False:
+                add_outcome(bayes["Counter"], win)
+            if r["Side"] == "Buy":
+                add_outcome(bayes["Buy"], win)
+            elif r["Side"] == "Sell":
+                add_outcome(bayes["Sell"], win)
+            if r.get("AlignedBreakoutOverride"):
+                add_outcome(bayes["Override"], win)
+        BAYES_STATE_FILE.write_text(json.dumps(bayes), encoding="utf-8")
+        print(f"  [TrendAligned1h aligned] 승률: {beta_verdict(bayes['Aligned']['Alpha'], bayes['Aligned']['Beta'])}")
+        print(f"  [TrendAligned1h counter] 승률: {beta_verdict(bayes['Counter']['Alpha'], bayes['Counter']['Beta'])}")
+        print(f"  [Buy] 승률: {beta_verdict(bayes['Buy']['Alpha'], bayes['Buy']['Beta'])}")
+        print(f"  [Sell] 승률: {beta_verdict(bayes['Sell']['Alpha'], bayes['Sell']['Beta'])}")
+        print(f"  [AlignedBreakoutOverride] 승률: {beta_verdict(bayes['Override']['Alpha'], bayes['Override']['Beta'])}")
+    else:
+        print("results 없음 - 갱신 생략")
 
     print()
     print("=" * 64)
